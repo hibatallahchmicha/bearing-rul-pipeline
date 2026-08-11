@@ -96,9 +96,8 @@ above to work.
 | — | CI | `.github/workflows/ci.yml` | Built, lint + pytest on 3.11/3.12 |
 
 All 10 core modules were first verified against synthetic/known-signal
-inputs (see `CHECKPOINTS.md` for the reasoning behind each and the
-checkpoint Q&A), then run end-to-end against the real, fully-extracted
-IMS dataset via `scripts/run_pipeline.py`. **Real result: mean leave-one-
+inputs, then run end-to-end against the real, fully-extracted IMS dataset
+via `scripts/run_pipeline.py`. **Real result: mean leave-one-
 bearing-out stage accuracy 0.544** across the 4 real failing bearings —
 see "Real-data results" below for the full story, including a genuine
 bug found and fixed along the way. Real extracted paths, irregular per
@@ -118,7 +117,7 @@ actually run to failure within the recording (test 1: bearings 3 & 4;
 test 2: bearing 1; test 3: bearing 3) — the rest just run healthy for the
 whole recording window. That small number of true run-to-failure
 trajectories is *why* evaluation uses leave-one-bearing-out instead of a
-random split — see `CHECKPOINTS.md`, module 6 and 7 entries, for the full
+random split — see the evaluation decision in `README.md` for the full
 reasoning.
 
 Each snapshot file is ~1 second of vibration (20480 samples at 20 kHz),
@@ -136,7 +135,7 @@ channels (1 per bearing).
   overfitting risk. Classification only needs to learn thresholds on the
   health index, and each bearing still contributes thousands of self-
   labeled windows. RUL regression remains a documented option for later,
-  not built. Full reasoning in `CHECKPOINTS.md`, module 8 entry.
+  not built.
 - **Cost model constants (module 8):** illustrative only (missed failure
   assumed 10x costlier than a false alarm) — not sourced from a real
   maintenance budget, since none exists for this project. Stated as a
@@ -160,15 +159,15 @@ bearing's features against its *own* early-life mean/std before pooling
 calibration, not leakage, since it never uses failure-time information.
 Result after the fix: **0.544**, more than double, with informative
 fold-to-fold variance (0.380-0.726) expected given only 4 real units.
-Full diagnostic narrative in `CHECKPOINTS.md`.
+Per-fold numbers are tabulated in `README.md`.
 
 ## Known limitations (stated, not hidden)
 
 - **Cost-threshold evaluation leakage — found and fixed.** Originally
   tuned directly against the held-out unit's own true labels. Fixed by
   sweeping on pooled *train*-unit scores/labels only, then scoring that
-  fixed threshold against the held-out unit. Full before/after numbers in
-  `CHECKPOINTS.md`.
+  fixed threshold against the held-out unit. Before/after numbers in
+  `README.md`.
 - **Alarm threshold doesn't transfer well across bearings, now that the
   leak is fixed and this is visible:** the train-derived threshold misses
   70-80% of real critical windows on 3 of 4 held-out bearings. Likely
@@ -183,16 +182,20 @@ Full diagnostic narrative in `CHECKPOINTS.md`.
 
 ## Still open
 
-- `scripts/ingest_stream.py` CLI wrapper around `ingestion.stream_snapshots`.
-- `README.md` (public) — intentionally last.
-- Whether `NOTES_PRIVATE.md` is still needed given `CHECKPOINTS.md` already
-  covers ELI5-to-expert reasoning and interview Q&A for every module.
+- `scripts/ingest_stream.py` — a thin CLI wrapper around
+  `ingestion.stream_snapshots`, so the streaming replay can be driven from
+  the command line rather than only from Python.
+- A health index normalized by degradation *magnitude* rather than
+  healthy-period spread, which is the most likely route to making the alarm
+  threshold transfer across bearings (see Known limitations).
+- Per-failure-mode alarm thresholds, as an alternative route to the same
+  problem.
+- RUL regression as a secondary, explicitly-caveated output alongside stage
+  classification.
 
 ## Where the reasoning lives
 
-- `CHECKPOINTS.md` (gitignored, local only) — every "why this choice"
-  question asked during development, with full answers. This is the
-  interview-prep record.
-- `CLAUDE.md` (gitignored, local only) — the working rules for this repo
-  and environment quirks.
-- This file — the technical map, safe to extend as new modules land.
+- `README.md` — the public-facing summary, including every key design
+  decision and the measured results.
+- This file — the technical map and design-decision record, extended as new
+  modules land.

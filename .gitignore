@@ -6,24 +6,14 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Raw and intermediate data are large and not committed; scripts/download_data.py
-# reproduces data/raw, and the pipeline reproduces data/processed.
-data/raw/
-data/processed/
+# Raw vibration data is ~3 GB and reproducible from the public NASA IMS
+# download (see README), so it is never committed.
+data/
 *.zip
-
-# Trained artefacts are reproducible via `make train`; only metrics/manifests are tracked.
-models/*.onnx
-models/*.pt
-models/*.pkl
+*.7z
+*.rar
 
 .env
-NOTES_PRIVATE.md
-
-# Local Claude Code tooling config -- not repo content, never pushed.
-CLAUDE.md
-.claude/
-CHECKPOINTS.md
 
 .DS_Store
 Thumbs.db
