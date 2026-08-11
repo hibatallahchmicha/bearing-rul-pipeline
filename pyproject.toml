@@ -1,0 +1,41 @@
+[project]
+name = "bearing-rul-pipeline"
+version = "0.1.0"
+description = "Signal-processing pipeline for rolling-element bearing degradation: raw vibration -> windowed features -> health index -> RUL estimation"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "scikit-learn>=1.4",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["bearing_pdm*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+# B008: flags function calls in argument defaults because mutable defaults
+# get shared across calls. BearingGeometry is a frozen (immutable)
+# dataclass, so fault_frequencies.py's `geometry: BearingGeometry =
+# BearingGeometry()` default is safe -- the concern the rule guards
+# against doesn't apply here.
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
