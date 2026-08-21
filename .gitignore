@@ -15,5 +15,11 @@ data/
 
 .env
 
+# Personal working notes and learning material -- not repo content.
+docs/private/
+
+# MLflow local tracking store; runs are reproducible from the pipeline.
+mlruns/
+
 .DS_Store
 Thumbs.db
