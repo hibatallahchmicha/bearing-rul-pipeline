@@ -164,6 +164,21 @@ bearing. **Leave-one-bearing-out** cross-validation is used instead: each
 bearing is held out exactly once, trained on the other three. A test asserts
 no unit appears on both sides of any fold.
 
+The guarantee is enforced rather than documented. `assert_no_unit_overlap`
+raises an explicit `AssertionError` instead of using a bare `assert`
+statement, because Python strips asserts under `-O` — a leakage guard that
+disappears in optimized execution is a comment, not a control. A regression
+test constructs the exact mistake a naive positional split would make
+(`rows[:80]` / `rows[80:]`, which cuts through the middle of a bearing) and
+asserts the guard catches it.
+
+Splitting is available at two levels. `leave_one_unit_out` partitions a list
+of unit IDs; `split_by_unit` partitions a flat, row-aligned array of unit
+labels and returns boolean row masks directly. The second exists because the
+caller's own indexing step — turning "hold out bearing 3" into actual rows —
+is where leakage is reintroduced in practice, and returning masks removes
+that step entirely.
+
 ### Alarm threshold from a cost model, not from accuracy
 
 A missed failure and a false alarm are not equally expensive. Accuracy — and
