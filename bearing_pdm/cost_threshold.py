@@ -48,8 +48,17 @@ def sweep_thresholds(
     """Evaluate expected cost across a range of candidate thresholds.
 
     `is_critical` is the ground-truth boolean label for each window in
-    `health_scores`. Both must come from held-out (test) bearings only --
-    sweeping on training data picks a threshold that flatters itself.
+    `health_scores`. Both must come from the fold's TRAINING bearings --
+    never from the held-out unit. Sweeping on the unit you then report
+    against selects the threshold that happens to suit that unit's own
+    labels, which is leakage: it reports a threshold's best-case
+    performance as if it were its expected performance. An earlier
+    version of run_pipeline.py did exactly this, and fixing it raised the
+    measured missed-failure rate on one fold from 0.005 to 0.771.
+
+    Note also that expected cost is computed from raw COUNTS, not rates,
+    so pooling training bearings of unequal length lets the longest unit
+    dominate the chosen threshold.
     """
     candidates = np.linspace(health_scores.min(), health_scores.max(), n_candidates)
     results = []
