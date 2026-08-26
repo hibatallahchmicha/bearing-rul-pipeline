@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # Silver — validated, labelled snapshots
 # MAGIC
@@ -20,6 +24,11 @@
 # MAGIC
 # MAGIC **Write mode.** Bronze is append-only and immutable; Silver is derived
 # MAGIC and therefore `overwrite` -- always fully rebuildable from Bronze.
+
+# COMMAND ----------
+
+import os
+print(os.getcwd())
 
 # COMMAND ----------
 
