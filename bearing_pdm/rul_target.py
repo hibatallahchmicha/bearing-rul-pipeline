@@ -23,12 +23,21 @@ The 168-hour (7-day) default is an operational choice, not a tuned one:
 maintenance scheduling runs on a weekly horizon, so resolution beyond one
 week has no decision value even where it is theoretically observable.
 
-Known limitation, visible in any leave-one-bearing-out result built on
-this target: the four run-to-failure units have lifespans of roughly
-360 h, 360 h, 164 h and 1054 h. A model trained on short-lived units and
-tested on a long-lived one will systematically under-predict, and vice
-versa. This is the same cross-unit transfer problem that limits the alarm
-threshold, and it is reported rather than tuned away.
+Known limitation, measured directly from Bronze rather than estimated:
+the run-to-failure units have very unequal lifespans. 1st_test_b3 and
+1st_test_b4 each run 827.6 h (34 days); 2nd_test_b1 runs 163.8 h (6.8
+days) -- a 5x ratio. The cap therefore binds unevenly: 2nd_test_b1's
+entire life sits under 168 h and its target varies continuously, while
+roughly 80% of a 1st_test bearing's rows are pinned at exactly 168.0. A
+model trained on one and evaluated on the other will systematically
+mis-predict early life -- the same cross-unit transfer problem that
+limits the alarm threshold, reported here rather than tuned away.
+
+Recording cadence is also not uniform across test sets: 2nd_test matches
+NASA's documented 10-minute interval, but 1st_test averages ~23 minutes
+across 34 days with gaps. This is why RUL is derived from actual
+timestamps rather than from a snapshot index -- assuming uniform 10-minute
+spacing would have made every 1st_test label wrong by a factor of ~2.3.
 """
 
 from __future__ import annotations
