@@ -20,7 +20,7 @@
 
 # COMMAND ----------
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import numpy as np
 import pandas as pd
@@ -217,7 +217,7 @@ def write_chunk(rows) -> None:
 
 # COMMAND ----------
 
-ingested_at = datetime.now(timezone.utc)
+ingested_at = datetime.now(UTC)
 
 for bearing_id, test_set, subdir, channel in BEARINGS:
     buffer, written = [], 0

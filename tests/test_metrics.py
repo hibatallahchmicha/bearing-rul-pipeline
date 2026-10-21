@@ -3,10 +3,10 @@ import pytest
 
 from bearing_pdm.metrics import (
     DEFAULT_ALERT_HORIZON_HOURS,
+    alarm_cost,
     asymmetric_score,
     provable_false_alarm_rate,
     rul_metrics,
-    alarm_cost,
 )
 
 

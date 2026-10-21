@@ -41,7 +41,7 @@ if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import mlflow
 import pandas as pd
@@ -135,9 +135,10 @@ def as_feature_dict(matrix, rows):
 
 joined, matrix, reference_rows, current_rows = health_conditioned_populations(gold)
 reference = as_feature_dict(matrix, reference_rows)
-print(f"reference: {reference_rows.sum()} healthy training snapshots from {sorted(joined.loc[reference_rows, 'bearing_id'].unique())}")
-print(f"current:   {current_rows.sum()} model-says-healthy new snapshots from {sorted(joined.loc[current_rows, 'bearing_id'].unique())}")
-
+reference_bearings = sorted(joined.loc[reference_rows, "bearing_id"].unique())
+current_bearings = sorted(joined.loc[current_rows, "bearing_id"].unique())
+print(f"reference: {reference_rows.sum()} healthy training snapshots from {reference_bearings}")
+print(f"current:   {current_rows.sum()} model-says-healthy new snapshots from {current_bearings}")
 # COMMAND ----------
 
 # MAGIC %md
@@ -157,10 +158,11 @@ for test_set in sorted(joined.loc[current_rows, "test_set"].unique()):
     by_test_set[test_set] = detect_drift(reference, as_feature_dict(matrix, rows))
 
 print(f"PSI threshold {PSI_DRIFT_THRESHOLD}; alarm when >= {DRIFTED_FEATURE_FRACTION_ALARM:.0%} of features drift")
-print(f"observed, all new bearings: {len(observed.drifted_features)}/{observed.n_features} drifted -> {observed.drift_detected}")
+n_obs = f"{len(observed.drifted_features)}/{observed.n_features}"
+print(f"observed, all new bearings: {n_obs} drifted -> {observed.drift_detected}")
 for test_set, report in by_test_set.items():
-    print(f"observed, {test_set} only:    {len(report.drifted_features)}/{report.n_features} drifted -> {report.drift_detected}")
-
+    n_set = f"{len(report.drifted_features)}/{report.n_features}"
+    print(f"observed, {test_set} only:    {n_set} drifted -> {report.drift_detected}")
 # COMMAND ----------
 
 # MAGIC %md
@@ -224,7 +226,7 @@ display(psi_table.sort_values(["scale_dependent", "feature"]).round(3))
 
 # COMMAND ----------
 
-checked_at = datetime.now(timezone.utc)
+checked_at = datetime.now(UTC)
 scenarios = [("observed", observed)]
 scenarios += [(f"observed_{ts}", r) for ts, r in by_test_set.items()]
 scenarios += [(f"simulated_gain_{SIMULATED_GAIN}", simulated)]

@@ -23,7 +23,7 @@ REPO_ROOT = os.path.dirname(os.getcwd())
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import mlflow
 import pandas as pd
@@ -80,7 +80,7 @@ assert not missing, f"Gold lacks columns the champion was trained on: {missing}"
 ordered, matrix = build_sensor_matrix(gold, feature_columns, healthy_fraction=healthy_fraction)
 predicted = predict_clipped(model, pd.DataFrame(matrix, columns=feature_columns), rul_cap_hours)
 
-scored_at = datetime.now(timezone.utc)
+scored_at = datetime.now(UTC)
 predictions = ordered[["bearing_id", "test_set", "snapshot_ts", "elapsed_hours", "runs_to_failure"]].copy()
 predictions["predicted_rul_hours"] = predicted
 predictions["maintenance_alert"] = predicted <= DEFAULT_ALERT_HORIZON_HOURS

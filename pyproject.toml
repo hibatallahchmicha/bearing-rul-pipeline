@@ -34,5 +34,12 @@ select = ["E", "F", "I", "UP", "B"]
 # against doesn't apply here.
 ignore = ["B008"]
 
+[tool.ruff.lint.per-file-ignores]
+# Databricks notebooks exported as .py source. F821: `spark`, `display` and
+# `dbutils` are globals the Databricks runtime injects into every notebook.
+# E402: each notebook has to put the repo root on sys.path before it can
+# import bearing_pdm, so those imports cannot sit at the top of the file.
+"databricks/*.py" = ["F821", "E402"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

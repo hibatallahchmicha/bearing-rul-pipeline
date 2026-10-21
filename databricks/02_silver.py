@@ -28,6 +28,7 @@
 # COMMAND ----------
 
 import os
+
 print(os.getcwd())
 
 # COMMAND ----------
@@ -41,13 +42,12 @@ REPO_PATH = "/Workspace/Repos/bearing-rul-pipeline"
 if REPO_PATH not in sys.path:
     sys.path.append(REPO_PATH)
 
-from bearing_pdm.ingestion import SAMPLES_PER_FILE
-from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
-
 # COMMAND ----------
-
 from pyspark.sql import Window
 from pyspark.sql import functions as F
+
+from bearing_pdm.ingestion import SAMPLES_PER_FILE
+from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
 
 CATALOG = "bearing"
 BRONZE_TABLE = f"{CATALOG}.bronze.raw_snapshots"

@@ -19,10 +19,17 @@ trained on the rest, results averaged across folds -- more data-efficient, and h
 the small-n regime this project is actually in.
 
 Two APIs are provided at different levels:
-- `leave_one_unit_out` works on a list of unit IDs. The caller then selects its own data for those units.
-- `split_by_unit` works on a flat, row-aligned array of unit labels -- one label per feature row -- and returns boolean row masks directly. This is the API to use once features live in a single table, because it removes the caller's indexing step, which is precisely where the leak gets reintroduced in practice.
-Both route their guarantee through `assert_no_unit_overlap`, which raises an explicit `AssertionError` rather than using a bare `assert` statement.
-This is deliberate: Python removes every `assert` under `-O` / `PYTHONOPTIMIZE`, so a leakage guard written as a bare assert silently disappears in optimized execution -- exactly the environment a scheduled job is most likely to run in.
+- `leave_one_unit_out` works on a list of unit IDs. The caller then selects its own data
+  for those units.
+- `split_by_unit` works on a flat, row-aligned array of unit labels -- one label per feature
+  row -- and returns boolean row masks directly. This is the API to use once features live in
+  a single table, because it removes the caller's indexing step, which is precisely where the
+  leak gets reintroduced in practice.
+Both route their guarantee through `assert_no_unit_overlap`, which raises an explicit
+`AssertionError` rather than using a bare `assert` statement. This is deliberate: Python removes
+every `assert` under `-O` / `PYTHONOPTIMIZE`, so a leakage guard written as a bare assert
+silently disappears in optimized execution -- exactly the environment a scheduled job is most
+likely to run in. `PYTHONOPTIMIZE`, so a leakage guard written as a bare assert silently disappears in optimized execution -- exactly the environment a scheduled job is most likely to run in.
 """
 
 from __future__ import annotations

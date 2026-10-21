@@ -32,8 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from bearing_pdm.cost_threshold import COST_FALSE_ALARM, COST_MISSED_FAILURE
 
+from bearing_pdm.cost_threshold import COST_FALSE_ALARM, COST_MISSED_FAILURE
 from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
 
 # C-MAPSS scoring constants, defined against its 125-cycle target range.
