@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from bearing_pdm.cost_threshold import COST_FALSE_ALARM, COST_MISSED_FAILURE
 
 from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
 
@@ -133,3 +134,57 @@ def provable_false_alarm_rate(
     if not provably_safe.any():
         return float("nan")
     return float(np.mean(predicted_rul[provably_safe] <= alert_horizon_hours))
+
+
+@dataclass(frozen=True)
+class AlarmCost:
+    false_alarms: int
+    missed_alarms: int
+    cost: float
+
+
+def alarm_cost(
+    predicted_rul: np.ndarray,
+    hours_to_end: np.ndarray,
+    censored: np.ndarray,
+    alert_horizon_hours: float = DEFAULT_ALERT_HORIZON_HOURS,
+    cost_false_alarm: float = COST_FALSE_ALARM,
+    cost_missed_failure: float = COST_MISSED_FAILURE,
+) -> AlarmCost:
+    """Expected cost of the maintenance alert, judging both kinds of mistake.
+
+    An alert fires when predicted RUL <= the horizon. Two mistakes:
+
+    - False alarm: an alert while the bearing had more than the horizon
+      left. Judgeable on every bearing -- for a bearing still running when
+      its recording ended (`censored`), `hours_to_end` is a lower bound on
+      remaining life, which is enough to prove the alert premature.
+    - Missed alarm: no alert while the bearing had the horizon or less left.
+      Judgeable only on bearings observed to fail; a censored bearing was
+      never seen failing, so silence on it can never be proven wrong.
+
+    Weighting uses the same cost ratio as `cost_threshold`, so the alarm
+    gate and the alarm threshold share one definition of what a mistake
+    costs rather than each inventing their own.
+    """
+    predicted_rul = np.asarray(predicted_rul, dtype=float)
+    hours_to_end = np.asarray(hours_to_end, dtype=float)
+    censored = np.asarray(censored, dtype=bool)
+
+    if not (predicted_rul.shape == hours_to_end.shape == censored.shape):
+        raise ValueError(
+            f"shape mismatch: predicted {predicted_rul.shape}, "
+            f"hours_to_end {hours_to_end.shape}, censored {censored.shape}"
+        )
+    if alert_horizon_hours <= 0:
+        raise ValueError(f"alert_horizon_hours must be positive, got {alert_horizon_hours}")
+
+    alert = predicted_rul <= alert_horizon_hours
+    false_alarms = int(np.sum(alert & (hours_to_end > alert_horizon_hours)))
+    missed_alarms = int(np.sum(~alert & (hours_to_end <= alert_horizon_hours) & ~censored))
+
+    return AlarmCost(
+        false_alarms=false_alarms,
+        missed_alarms=missed_alarms,
+        cost=false_alarms * cost_false_alarm + missed_alarms * cost_missed_failure,
+    )

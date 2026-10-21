@@ -6,6 +6,7 @@ from bearing_pdm.metrics import (
     asymmetric_score,
     provable_false_alarm_rate,
     rul_metrics,
+    alarm_cost,
 )
 
 
@@ -97,3 +98,38 @@ def test_default_horizon_is_48_hours():
 def test_false_alarm_rate_rejects_shape_mismatch():
     with pytest.raises(ValueError):
         provable_false_alarm_rate(np.array([1.0, 2.0]), np.array([1.0]))
+
+def test_alarm_cost_counts_both_mistakes():
+    hours_to_end = np.array([100.0, 100.0, 20.0, 20.0])
+    predicted = np.array([10.0, 150.0, 10.0, 150.0])
+    # row 0: alert, 100 h left  -> false alarm
+    # row 1: silent, 100 h left -> correct
+    # row 2: alert, 20 h left   -> correct
+    # row 3: silent, 20 h left  -> missed alarm
+    result = alarm_cost(predicted, hours_to_end, censored=np.zeros(4, dtype=bool))
+    assert result.false_alarms == 1
+    assert result.missed_alarms == 1
+
+
+def test_missed_alarm_costs_ten_times_a_false_alarm_by_default():
+    one_false = alarm_cost(np.array([10.0]), np.array([100.0]), censored=np.array([False]))
+    one_missed = alarm_cost(np.array([150.0]), np.array([20.0]), censored=np.array([False]))
+    assert one_missed.cost == 10 * one_false.cost
+
+
+def test_censored_bearing_never_counts_as_missed():
+    """Silence near the end of a healthy bearing's recording can't be proven
+    wrong -- it was never seen failing."""
+    result = alarm_cost(np.array([150.0]), np.array([20.0]), censored=np.array([True]))
+    assert result.missed_alarms == 0
+    assert result.cost == 0
+
+
+def test_censored_bearing_still_counts_provable_false_alarms():
+    result = alarm_cost(np.array([10.0]), np.array([100.0]), censored=np.array([True]))
+    assert result.false_alarms == 1
+
+
+def test_alarm_cost_rejects_shape_mismatch():
+    with pytest.raises(ValueError):
+        alarm_cost(np.array([1.0, 2.0]), np.array([1.0]), censored=np.array([False]))
