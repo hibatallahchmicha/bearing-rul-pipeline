@@ -155,7 +155,7 @@ with mlflow.start_run(run_name=f"register_{winner_name}") as run:
     mlflow.log_dict({"feature_columns": FEATURE_COLUMNS}, "feature_columns.json")
 
     signature = infer_signature(X, model.predict(X))
-    mlflow.sklearn.log_model(
+    model_info = mlflow.sklearn.log_model(
         model,
         artifact_path="model",
         signature=signature,
@@ -163,7 +163,9 @@ with mlflow.start_run(run_name=f"register_{winner_name}") as run:
         registered_model_name=MODEL_NAME,
     )
 
-new_version = client.search_model_versions(f"run_id = '{run.info.run_id}'")[0].version
+# log_model reports the version it just registered -- no need to search the
+# registry for it (searching Unity Catalog by run_id is not reliably supported).
+new_version = model_info.registered_model_version
 print(f"registered {MODEL_NAME} version {new_version}")
 
 for key, value in {
