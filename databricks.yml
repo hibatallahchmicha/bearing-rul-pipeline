@@ -1,0 +1,73 @@
+# Databricks Asset Bundle: the pipeline's jobs, defined as code.
+#
+#   databricks bundle validate     check the definition
+#   databricks bundle deploy       create or update the jobs in the workspace
+#   databricks bundle run bearing_rul_scoring
+#
+# No compute is specified, so tasks run on serverless compute.
+
+bundle:
+  name: bearing-rul-pipeline
+
+resources:
+  jobs:
+    # Routine loop: score with the current champion, then check for drift.
+    # Deployed paused so it does not spend quota daily until deliberately enabled.
+    bearing_rul_scoring:
+      name: bearing-rul-scoring
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: "Africa/Casablanca"
+        pause_status: PAUSED
+      tasks:
+        - task_key: batch_score
+          notebook_task:
+            notebook_path: ./databricks/06_batch_score.py
+        - task_key: drift_monitor
+          depends_on:
+            - task_key: batch_score
+          notebook_task:
+            notebook_path: ./databricks/07_drift_monitor.py
+
+    # Full retrain: rebuild features, re-evaluate, register, gate, re-score.
+    # Manual only -- retraining redefines "healthy" and needs a human decision.
+    # Bronze is excluded: its ingestion is not incremental, so re-running it
+    # would append every file a second time.
+    bearing_rul_retrain:
+      name: bearing-rul-retrain
+      tasks:
+        - task_key: silver
+          notebook_task:
+            notebook_path: ./databricks/02_silver.py
+        - task_key: gold
+          depends_on:
+            - task_key: silver
+          notebook_task:
+            notebook_path: ./databricks/03_gold_features.py
+        - task_key: train_evaluate
+          depends_on:
+            - task_key: gold
+          notebook_task:
+            notebook_path: ./databricks/04_train_evaluate.py
+        - task_key: register_promote
+          depends_on:
+            - task_key: train_evaluate
+          notebook_task:
+            notebook_path: ./databricks/05_register_promote.py
+        - task_key: batch_score
+          depends_on:
+            - task_key: register_promote
+          notebook_task:
+            notebook_path: ./databricks/06_batch_score.py
+        - task_key: drift_monitor
+          depends_on:
+            - task_key: batch_score
+          notebook_task:
+            notebook_path: ./databricks/07_drift_monitor.py
+
+targets:
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://dbc-8b75ce4f-63f2.cloud.databricks.com
