@@ -1,17 +1,21 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Train & evaluate — does vibration beat a clock?
+# MAGIC # Train & evaluate — does vibration beat a clock, without crying wolf?
 # MAGIC
 # MAGIC Four predictors, one leave-one-bearing-out split, one metric suite, all
 # MAGIC logged to MLflow. The comparison that matters is the vibration-feature
 # MAGIC models against `baseline_linear_degradation`, which uses elapsed
-# MAGIC operating hours and nothing else. The margin between them is the
-# MAGIC measured value of the entire signal-processing stage.
+# MAGIC operating hours and nothing else.
 # MAGIC
-# MAGIC **Data versioning.** Gold is read at a pinned Delta version and that
-# MAGIC version is logged on every run. Delta time travel only reaches back as
-# MAGIC far as the file-retention window (7 days by default), so it cannot be
-# MAGIC the long-term record of what a model was trained on — the MLflow run is.
+# MAGIC **False alarms are measured too.** Accuracy on failing bearings says
+# MAGIC nothing about alerts on healthy ones. Two out-of-sample rates are logged:
+# MAGIC alerts on held-out failing bearings while they provably had more than the
+# MAGIC alert horizon left, and alerts on the bearings that never failed — which
+# MAGIC are never used for training, so every model sees them for the first time.
+# MAGIC
+# MAGIC **Data versioning.** Gold is read at a pinned Delta version, logged on
+# MAGIC every run. Time travel only reaches back as far as file retention (7
+# MAGIC days by default), so the MLflow run is the long-term record.
 
 # COMMAND ----------
 
@@ -22,13 +26,15 @@ REPO_ROOT = os.path.dirname(os.getcwd())
 if REPO_ROOT not in sys.path:
     sys.path.append(REPO_ROOT)
 
+import mlflow
 import numpy as np
 import pandas as pd
 
 from bearing_pdm.baselines import LinearDegradationBaseline, MeanRULBaseline
 from bearing_pdm.evaluation import split_by_unit
-from bearing_pdm.metrics import rul_metrics
-from bearing_pdm.normalization import DEFAULT_HEALTHY_FRACTION, normalize_to_own_baseline
+from bearing_pdm.feature_matrix import build_sensor_matrix
+from bearing_pdm.metrics import DEFAULT_ALERT_HORIZON_HOURS, provable_false_alarm_rate, rul_metrics
+from bearing_pdm.normalization import DEFAULT_HEALTHY_FRACTION
 from bearing_pdm.rul_regressor import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_N_ESTIMATORS,
@@ -44,14 +50,8 @@ CATALOG = "bearing"
 GOLD_TABLE = f"{CATALOG}.gold.features"
 
 LABEL_COLUMNS = [
-    "bearing_id",
-    "test_set",
-    "channel",
-    "snapshot_ts",
-    "elapsed_hours",
-    "rul_hours",
-    "rul_hours_capped",
-    "runs_to_failure",
+    "bearing_id", "test_set", "channel", "snapshot_ts",
+    "elapsed_hours", "rul_hours", "rul_hours_capped", "runs_to_failure",
 ]
 
 current_user = spark.sql("SELECT current_user()").first()[0]
@@ -62,63 +62,44 @@ print(f"logging to experiment: {EXPERIMENT}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Load Gold at a pinned version
+# MAGIC ## Load every bearing from Gold, at a pinned version
 # MAGIC
-# MAGIC The version is captured first and the data is then read *at that
-# MAGIC version*, so the number logged to MLflow is guaranteed to be the data
-# MAGIC actually used — even if Gold is rewritten while this notebook runs.
+# MAGIC Failing bearings are used for training and evaluation; healthy ones
+# MAGIC only for measuring false alarms. `hours_to_end` is the time from each
+# MAGIC snapshot to the end of that bearing's recording: exact remaining life
+# MAGIC for a failing bearing, a lower bound for a healthy one.
 
 # COMMAND ----------
 
 gold_version = spark.sql(f"DESCRIBE HISTORY {GOLD_TABLE} LIMIT 1").first()["version"]
-
-gold = (
-    spark.sql(f"SELECT * FROM {GOLD_TABLE} VERSION AS OF {gold_version} WHERE runs_to_failure")
-    .toPandas()
-    .sort_values(["bearing_id", "snapshot_ts"])
-    .reset_index(drop=True)
-)
-
+gold = spark.sql(f"SELECT * FROM {GOLD_TABLE} VERSION AS OF {gold_version}").toPandas()
 FEATURE_COLUMNS = [c for c in gold.columns if c not in LABEL_COLUMNS]
-print(f"Gold version {gold_version}: {len(gold)} rows, {len(FEATURE_COLUMNS)} features")
-print(gold.groupby("bearing_id").size())
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Inputs
-# MAGIC
-# MAGIC - `X_sensor` — the 17 vibration features, each bearing normalized
-# MAGIC   against its own first 20% of life. Rows are already sorted by bearing
-# MAGIC   and time, which normalization requires.
-# MAGIC - `X_clock` — elapsed operating hours only, for the clock baseline.
-# MAGIC
-# MAGIC The models see vibration only. Giving them elapsed time as well would
-# MAGIC blur exactly the comparison this notebook exists to make.
-
-# COMMAND ----------
-
-X_sensor = np.vstack(
-    [
-        normalize_to_own_baseline(group[FEATURE_COLUMNS].to_numpy(dtype=float), DEFAULT_HEALTHY_FRACTION)
-        for _, group in gold.groupby("bearing_id", sort=True)
-    ]
+ordered, X_sensor_all = build_sensor_matrix(gold, FEATURE_COLUMNS, healthy_fraction=DEFAULT_HEALTHY_FRACTION)
+ordered["hours_to_end"] = (
+    ordered.groupby("bearing_id")["elapsed_hours"].transform("max") - ordered["elapsed_hours"]
 )
-X_clock = gold[["elapsed_hours"]].to_numpy(dtype=float)
-y = gold["rul_hours_capped"].to_numpy(dtype=float)
-units = gold["bearing_id"].to_numpy()
 
-assert X_sensor.shape == (len(gold), len(FEATURE_COLUMNS))
-assert np.all(np.isfinite(X_sensor)), "normalized features contain NaN or inf"
+X_clock_all = ordered[["elapsed_hours"]].to_numpy(dtype=float)
+y_all = ordered["rul_hours_capped"].to_numpy(dtype=float)
+units_all = ordered["bearing_id"].to_numpy()
+hours_to_end_all = ordered["hours_to_end"].to_numpy(dtype=float)
+failing = ordered["runs_to_failure"].to_numpy(dtype=bool)
+healthy = ~failing
+
+assert np.all(np.isfinite(X_sensor_all)), "normalized features contain NaN or inf"
+print(f"Gold version {gold_version}: {failing.sum()} failing-bearing rows, {healthy.sum()} healthy-bearing rows")
+print(ordered.groupby(["runs_to_failure", "bearing_id"]).size())
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Leave-one-bearing-out evaluation
+# MAGIC ## Evaluation
 # MAGIC
-# MAGIC One parent run per predictor, one child run per held-out bearing.
-# MAGIC Every prediction is clipped to the target's valid range [0, cap], the
-# MAGIC same rule for all four, so none gets an unfair advantage.
+# MAGIC Per predictor: leave-one-bearing-out over the failing bearings (accuracy
+# MAGIC plus false alarms on each held-out bearing), then one model trained on all
+# MAGIC failing bearings scores the healthy ones. Every prediction is clipped to
+# MAGIC [0, cap] by the same rule, so no predictor gets an unfair advantage.
 
 # COMMAND ----------
 
@@ -137,8 +118,9 @@ PREDICTORS = [
 summary = []
 
 for name, factory, inputs, hyperparams in PREDICTORS:
-    X = X_sensor if inputs == "sensor" else X_clock
-    fold_true, fold_pred = [], []
+    X_all = X_sensor_all if inputs == "sensor" else X_clock_all
+    X_f, y_f, units_f, hte_f = X_all[failing], y_all[failing], units_all[failing], hours_to_end_all[failing]
+    fold_true, fold_pred, fold_hte = [], [], []
 
     params = {
         "predictor": name,
@@ -147,35 +129,49 @@ for name, factory, inputs, hyperparams in PREDICTORS:
         "gold_table_version": gold_version,
         "rul_cap_hours": DEFAULT_RUL_CAP_HOURS,
         "healthy_fraction": DEFAULT_HEALTHY_FRACTION,
-        "n_input_columns": X.shape[1],
+        "alert_horizon_hours": DEFAULT_ALERT_HORIZON_HOURS,
+        "n_input_columns": X_all.shape[1],
         **hyperparams,
     }
 
     with parent_run(run_name=name, params=params):
-        for train_mask, test_mask in split_by_unit(units):
-            test_unit = units[test_mask][0]
-            model = factory().fit(X[train_mask], y[train_mask])
-            pred = predict_clipped(model, X[test_mask], DEFAULT_RUL_CAP_HOURS)
+        for train_mask, test_mask in split_by_unit(units_f):
+            test_unit = units_f[test_mask][0]
+            model = factory().fit(X_f[train_mask], y_f[train_mask])
+            pred = predict_clipped(model, X_f[test_mask], DEFAULT_RUL_CAP_HOURS)
 
             with fold_run(test_unit):
-                log_rul_metrics(rul_metrics(y[test_mask], pred))
+                log_rul_metrics(rul_metrics(y_f[test_mask], pred))
+                mlflow.log_metric("provable_false_alarm_rate", provable_false_alarm_rate(pred, hte_f[test_mask]))
 
-            fold_true.append(y[test_mask])
+            fold_true.append(y_f[test_mask])
             fold_pred.append(pred)
+            fold_hte.append(hte_f[test_mask])
 
         pooled = rul_metrics(np.concatenate(fold_true), np.concatenate(fold_pred))
         log_rul_metrics(pooled, prefix="pooled_")
+        pooled_far = provable_false_alarm_rate(np.concatenate(fold_pred), np.concatenate(fold_hte))
+
+        final_model = factory().fit(X_f, y_f)
+        healthy_pred = predict_clipped(final_model, X_all[healthy], DEFAULT_RUL_CAP_HOURS)
+        healthy_far = provable_false_alarm_rate(healthy_pred, hours_to_end_all[healthy])
+
+        mlflow.log_metrics(
+            {
+                "pooled_provable_false_alarm_rate": pooled_far,
+                "healthy_provable_false_alarm_rate": healthy_far,
+            }
+        )
 
     summary.append(
         {
             "predictor": name,
             "inputs": inputs,
             "asym_score_per_pred": pooled.asymmetric_score / pooled.n,
-            "late_fraction": pooled.late_fraction,
-            "mean_late_error_h": pooled.mean_late_error,
             "mae_h": pooled.mae,
-            "rmse_h": pooled.rmse,
-            "n": pooled.n,
+            "late_fraction": pooled.late_fraction,
+            "false_alarms_failing": pooled_far,
+            "false_alarms_healthy": healthy_far,
         }
     )
     print(f"{name}: done")
@@ -185,17 +181,11 @@ for name, factory, inputs, hyperparams in PREDICTORS:
 # MAGIC %md
 # MAGIC ## Results
 # MAGIC
-# MAGIC Ranked by asymmetric score per prediction — lower is better. Late
-# MAGIC predictions (the bearing fails before the model said it would) are
-# MAGIC penalized harder than early ones, because that is the failure that
-# MAGIC costs an unplanned breakdown.
+# MAGIC Ranked by asymmetric score per prediction — lower is better. The two
+# MAGIC false-alarm columns are shares of snapshots where the model alerted
+# MAGIC while the bearing provably had more than the alert horizon left.
 
 # COMMAND ----------
 
 results = pd.DataFrame(summary).sort_values("asym_score_per_pred").reset_index(drop=True)
 display(results.round(3))
-
-clock_score = results.loc[results["predictor"] == "baseline_linear_degradation", "asym_score_per_pred"].item()
-best = results.iloc[0]
-print(f"best predictor: {best['predictor']}")
-print(f"beats the clock baseline: {best['asym_score_per_pred'] < clock_score and best['inputs'] == 'sensor'}")

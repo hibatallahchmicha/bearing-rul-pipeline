@@ -1,6 +1,6 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Register & promote — only a model that beats the clock reaches production
+# MAGIC # Register & promote — only a model that beats the clock, without crying wolf
 # MAGIC
 # MAGIC Reads the evaluation runs from `04_train_evaluate`, retrains the best
 # MAGIC vibration model on all run-to-failure bearings, registers it in Unity
@@ -28,6 +28,7 @@ from mlflow.models import infer_signature
 from mlflow.tracking import MlflowClient
 
 from bearing_pdm.feature_matrix import build_sensor_matrix
+from bearing_pdm.metrics import DEFAULT_ALERT_HORIZON_HOURS
 from bearing_pdm.normalization import DEFAULT_HEALTHY_FRACTION
 from bearing_pdm.rul_regressor import build_gradient_boosting_regressor, build_ridge_regressor
 from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
@@ -37,11 +38,18 @@ GOLD_TABLE = f"{CATALOG}.gold.features"
 MODEL_SCHEMA = f"{CATALOG}.ml"
 MODEL_NAME = f"{MODEL_SCHEMA}.rul_regressor"
 
+# Alarm budget: an operational choice, not a tuned value. A model that raises
+# more than 1 provably false alert in 20 judgeable snapshots costs more in
+# wasted inspections than its early warnings are worth.
+MAX_PROVABLE_FALSE_ALARM_RATE = 0.05
+
 LABEL_COLUMNS = [
     "bearing_id", "test_set", "channel", "snapshot_ts",
     "elapsed_hours", "rul_hours", "rul_hours_capped", "runs_to_failure",
 ]
 SCORE = "metrics.pooled_asymmetric_score_per_prediction"
+FAR_FAILING = "metrics.pooled_provable_false_alarm_rate"
+FAR_HEALTHY = "metrics.healthy_provable_false_alarm_rate"
 CLOCK_BASELINE = "baseline_linear_degradation"
 
 current_user = spark.sql("SELECT current_user()").first()[0]
@@ -58,9 +66,9 @@ client = MlflowClient()
 # MAGIC %md
 # MAGIC ## Evaluation results for the current Gold version
 # MAGIC
-# MAGIC Only runs made on the Gold version that exists now count. If Gold was
-# MAGIC rebuilt since `04` ran, the old scores describe different data, and the
-# MAGIC notebook stops rather than promote a model judged on something else.
+# MAGIC Only runs made on the Gold version that exists now count, and only the
+# MAGIC most recent run per predictor. If Gold was rebuilt since `04` ran, the
+# MAGIC notebook stops rather than promote a model judged on other data.
 
 # COMMAND ----------
 
@@ -75,16 +83,18 @@ if "tags.mlflow.parentRunId" in runs.columns:
     runs = runs[runs["tags.mlflow.parentRunId"].isna()]
 
 latest = runs.drop_duplicates("params.predictor")
-assert not latest.empty, (
-    f"no evaluation runs for Gold version {gold_version} -- run 04_train_evaluate first"
-)
-display(latest[["params.predictor", "params.inputs", SCORE, "metrics.pooled_mae_hours"]])
+assert not latest.empty, f"no evaluation runs for Gold version {gold_version} -- run 04_train_evaluate first"
+assert FAR_HEALTHY in latest.columns, "evaluation runs lack false-alarm metrics -- re-run 04_train_evaluate"
+display(latest[["params.predictor", "params.inputs", SCORE, FAR_FAILING, FAR_HEALTHY]])
 
 clock_score = latest.loc[latest["params.predictor"] == CLOCK_BASELINE, SCORE].item()
 winner = latest[latest["params.inputs"] == "sensor"].sort_values(SCORE).iloc[0]
 winner_name = winner["params.predictor"]
 winner_score = float(winner[SCORE])
+winner_far_failing = float(winner[FAR_FAILING])
+winner_far_healthy = float(winner[FAR_HEALTHY])
 print(f"best vibration model: {winner_name} (score {winner_score:.1f}); clock baseline: {clock_score:.1f}")
+print(f"provable false alarms: {winner_far_failing:.3f} on failing bearings, {winner_far_healthy:.3f} on healthy bearings")
 
 # COMMAND ----------
 
@@ -93,8 +103,7 @@ print(f"best vibration model: {winner_name} (score {winner_score:.1f}); clock ba
 # MAGIC
 # MAGIC Evaluation trained on two bearings at a time to measure generalization.
 # MAGIC The model that ships is trained on all three, with the same
-# MAGIC hyperparameters and the same `build_sensor_matrix` preparation — the
-# MAGIC shared function is what keeps training and scoring inputs identical.
+# MAGIC hyperparameters and the same `build_sensor_matrix` preparation.
 
 # COMMAND ----------
 
@@ -129,11 +138,8 @@ print(f"trained {winner_name} on {len(X)} rows from {training_bearings}")
 # MAGIC ## Register with an explicit signature
 # MAGIC
 # MAGIC The signature records the 17 input columns and their types. Unity
-# MAGIC Catalog requires one, and it is what makes scoring with wrong-shaped data
-# MAGIC fail immediately instead of returning plausible nonsense.
-# MAGIC
-# MAGIC The registered model returns raw predictions; scoring clips them to
-# MAGIC [0, cap] with the same `predict_clipped` used in evaluation.
+# MAGIC Catalog requires one, and it makes scoring with wrong-shaped data fail
+# MAGIC immediately instead of returning plausible nonsense.
 
 # COMMAND ----------
 
@@ -148,6 +154,7 @@ with mlflow.start_run(run_name=f"register_{winner_name}") as run:
             "training_bearings": ",".join(training_bearings),
             "healthy_fraction": DEFAULT_HEALTHY_FRACTION,
             "rul_cap_hours": DEFAULT_RUL_CAP_HOURS,
+            "alert_horizon_hours": DEFAULT_ALERT_HORIZON_HOURS,
             "evaluation_run_id": winner["run_id"],
             **hyperparams,
         }
@@ -170,6 +177,8 @@ print(f"registered {MODEL_NAME} version {new_version}")
 
 for key, value in {
     "eval_asym_score_per_pred": winner_score,
+    "pooled_provable_false_alarm_rate": winner_far_failing,
+    "healthy_provable_false_alarm_rate": winner_far_healthy,
     "clock_baseline_score": clock_score,
     "gold_table_version": gold_version,
     "evaluation_run_id": winner["run_id"],
@@ -183,33 +192,53 @@ client.set_registered_model_alias(MODEL_NAME, "challenger", new_version)
 # MAGIC %md
 # MAGIC ## Promotion gate
 # MAGIC
-# MAGIC `champion` moves to the new version only if it beats the clock baseline
-# MAGIC AND beats the current champion's recorded evaluation score. A model that
-# MAGIC cannot beat elapsed operating time has not learned anything the
-# MAGIC calendar does not already know, and does not reach production.
+# MAGIC `champion` moves to the new version only if every check passes:
+# MAGIC
+# MAGIC 1. It beats the clock baseline — otherwise it has learned nothing the
+# MAGIC    calendar does not already know.
+# MAGIC 2. Provable false alarms on held-out failing bearings are within budget.
+# MAGIC 3. Provable false alarms on healthy bearings are within budget.
+# MAGIC 4. It beats the current champion — **if** that champion was itself
+# MAGIC    checked for false alarms. A champion promoted by the older gate, which
+# MAGIC    never measured false alarms, does not block one that passed the full
+# MAGIC    gate; otherwise the old blind spot would protect itself indefinitely.
+# MAGIC
+# MAGIC A NaN false-alarm rate (nothing judgeable) fails its check, so the gate
+# MAGIC fails safe rather than pass on no evidence.
 
 # COMMAND ----------
 
 try:
-    current = client.get_model_version_by_alias(MODEL_NAME, "champion")
-    current_score = float(current.tags["eval_asym_score_per_pred"])
+    alias_version = client.get_model_version_by_alias(MODEL_NAME, "champion")
+    current = client.get_model_version(MODEL_NAME, alias_version.version)
 except MlflowException:
-    current, current_score = None, float("inf")
+    current = None
 
-beats_clock = winner_score < clock_score
-beats_champion = winner_score < current_score
+checks = {
+    f"beats the clock baseline ({winner_score:.1f} < {clock_score:.1f})": winner_score < clock_score,
+    f"false alarms on failing bearings <= {MAX_PROVABLE_FALSE_ALARM_RATE} ({winner_far_failing:.3f})":
+        winner_far_failing <= MAX_PROVABLE_FALSE_ALARM_RATE,
+    f"false alarms on healthy bearings <= {MAX_PROVABLE_FALSE_ALARM_RATE} ({winner_far_healthy:.3f})":
+        winner_far_healthy <= MAX_PROVABLE_FALSE_ALARM_RATE,
+}
 
-if beats_clock and beats_champion:
+if current is not None and "healthy_provable_false_alarm_rate" in current.tags:
+    current_score = float(current.tags["eval_asym_score_per_pred"])
+    checks[f"beats champion v{current.version} ({winner_score:.1f} < {current_score:.1f})"] = (
+        winner_score < current_score
+    )
+elif current is not None:
+    print(f"note: champion v{current.version} predates false-alarm checks, so it does not block promotion")
+
+for description, passed in checks.items():
+    print(f"{'PASS' if passed else 'FAIL'}  {description}")
+
+if all(checks.values()):
     client.set_registered_model_alias(MODEL_NAME, "champion", new_version)
-    previous = f"version {current.version}" if current else "none"
-    print(f"PROMOTED: version {new_version} is now champion (previous champion: {previous})")
+    previous = f"v{current.version}" if current else "none"
+    print(f"\nPROMOTED: version {new_version} is now champion (previous: {previous})")
 else:
-    reasons = []
-    if not beats_clock:
-        reasons.append(f"does not beat the clock baseline ({winner_score:.1f} vs {clock_score:.1f})")
-    if not beats_champion:
-        reasons.append(f"does not beat champion v{current.version} ({winner_score:.1f} vs {current_score:.1f})")
-    print(f"NOT PROMOTED: version {new_version} stays challenger -- " + "; ".join(reasons))
+    print(f"\nNOT PROMOTED: version {new_version} stays challenger")
 
 # COMMAND ----------
 
@@ -225,14 +254,21 @@ else:
 
 # COMMAND ----------
 
-versions = client.search_model_versions(f"name = '{MODEL_NAME}'")
+# search_model_versions returns summaries; tags and aliases are only
+# reliably populated when each version is fetched individually.
+versions = [
+    client.get_model_version(MODEL_NAME, v.version)
+    for v in client.search_model_versions(f"name = '{MODEL_NAME}'")
+]
 display(
     pd.DataFrame(
         [
             {
-                "version": v.version,
-                "aliases": ", ".join(v.aliases),
+                "version": int(v.version),
+                "aliases": ", ".join(v.aliases or []),
                 "eval_score": v.tags.get("eval_asym_score_per_pred"),
+                "false_alarms_failing": v.tags.get("pooled_provable_false_alarm_rate"),
+                "false_alarms_healthy": v.tags.get("healthy_provable_false_alarm_rate"),
                 "gold_version": v.tags.get("gold_table_version"),
             }
             for v in versions

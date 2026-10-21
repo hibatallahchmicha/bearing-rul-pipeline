@@ -30,6 +30,7 @@ import pandas as pd
 from mlflow.tracking import MlflowClient
 
 from bearing_pdm.feature_matrix import build_sensor_matrix
+from bearing_pdm.metrics import DEFAULT_ALERT_HORIZON_HOURS
 from bearing_pdm.rul_regressor import predict_clipped
 
 CATALOG = "bearing"
@@ -37,9 +38,7 @@ GOLD_TABLE = f"{CATALOG}.gold.features"
 PREDICTIONS_TABLE = f"{CATALOG}.gold.rul_predictions"
 MODEL_NAME = f"{CATALOG}.ml.rul_regressor"
 
-# Operational choice, not a tuned value: 48 hours is enough lead time to
-# schedule a technician and order a replacement bearing.
-ALERT_HORIZON_HOURS = 48.0
+
 
 mlflow.set_tracking_uri("databricks")
 mlflow.set_registry_uri("databricks-uc")
