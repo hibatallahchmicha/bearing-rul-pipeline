@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 
-from bearing_pdm.metrics import asymmetric_score, rul_metrics
+from bearing_pdm.metrics import (
+    DEFAULT_ALERT_HORIZON_HOURS,
+    asymmetric_score,
+    provable_false_alarm_rate,
+    rul_metrics,
+)
 
 
 def test_perfect_prediction_scores_zero():
@@ -66,3 +71,29 @@ def test_rejects_shape_mismatch():
 def test_rejects_empty_prediction_set():
     with pytest.raises(ValueError):
         rul_metrics(np.array([]), np.array([]))
+
+def test_alert_inside_the_horizon_is_not_a_false_alarm():
+    hours_to_end = np.array([100.0, 30.0])
+    predicted = np.array([150.0, 10.0])  # alerts only at 30 h before end
+    assert provable_false_alarm_rate(predicted, hours_to_end) == 0.0
+
+
+def test_alert_far_from_the_end_is_a_false_alarm():
+    hours_to_end = np.array([200.0, 100.0, 30.0])
+    predicted = np.array([150.0, 20.0, 10.0])  # alert at 100 h: provably false
+    assert provable_false_alarm_rate(predicted, hours_to_end) == 0.5
+
+
+def test_no_judgeable_snapshots_returns_nan_so_gates_fail_safe():
+    rate = provable_false_alarm_rate(np.array([5.0, 3.0]), np.array([20.0, 10.0]))
+    assert np.isnan(rate)
+    assert not (rate <= 0.05)
+
+
+def test_default_horizon_is_48_hours():
+    assert DEFAULT_ALERT_HORIZON_HOURS == 48.0
+
+
+def test_false_alarm_rate_rejects_shape_mismatch():
+    with pytest.raises(ValueError):
+        provable_false_alarm_rate(np.array([1.0, 2.0]), np.array([1.0]))

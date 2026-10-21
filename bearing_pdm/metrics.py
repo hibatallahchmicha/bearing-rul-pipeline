@@ -39,6 +39,9 @@ from bearing_pdm.rul_target import DEFAULT_RUL_CAP_HOURS
 CMAPSS_EARLY_SCALE = 13.0
 CMAPSS_LATE_SCALE = 10.0
 CMAPSS_REFERENCE_RANGE = 125.0
+# Operational choice, not a tuned value: 48 hours is enough lead time to
+# schedule a technician and order a replacement bearing.
+DEFAULT_ALERT_HORIZON_HOURS = 48.0
 
 # Guards the exponential against overflow on a pathological prediction.
 MAX_SCORE_EXPONENT = 50.0
@@ -97,3 +100,36 @@ def rul_metrics(
         rmse=float(np.sqrt(np.mean(error**2))),
         n=int(y_true.size),
     )
+def provable_false_alarm_rate(
+    predicted_rul: np.ndarray,
+    hours_to_end: np.ndarray,
+    alert_horizon_hours: float = DEFAULT_ALERT_HORIZON_HOURS,
+) -> float:
+    """Share of alerts raised when the bearing provably had more time left.
+
+    `hours_to_end` is the time from each snapshot to the end of that
+    bearing's recording. For a bearing that failed, this IS its remaining
+    life. For a bearing still running when the test stopped, it is only a
+    lower bound -- the label is right-censored. In both cases, a snapshot
+    with more than `alert_horizon_hours` to go provably had more than the
+    horizon left, so an alert there is provably false.
+
+    This is what lets bearings that never failed -- which have no RUL label
+    at all -- still be used to measure false alarms.
+
+    Returns NaN when no snapshot is far enough from the end to judge.
+    NaN fails every comparison, so a promotion gate checking
+    `rate <= limit` fails safe instead of passing on no evidence.
+    """
+    predicted_rul = np.asarray(predicted_rul, dtype=float)
+    hours_to_end = np.asarray(hours_to_end, dtype=float)
+
+    if predicted_rul.shape != hours_to_end.shape:
+        raise ValueError(f"shape mismatch: predicted {predicted_rul.shape}, hours_to_end {hours_to_end.shape}")
+    if alert_horizon_hours <= 0:
+        raise ValueError(f"alert_horizon_hours must be positive, got {alert_horizon_hours}")
+
+    provably_safe = hours_to_end > alert_horizon_hours
+    if not provably_safe.any():
+        return float("nan")
+    return float(np.mean(predicted_rul[provably_safe] <= alert_horizon_hours))
