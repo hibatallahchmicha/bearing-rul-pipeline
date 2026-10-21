@@ -29,7 +29,7 @@ Both route their guarantee through `assert_no_unit_overlap`, which raises an exp
 `AssertionError` rather than using a bare `assert` statement. This is deliberate: Python removes
 every `assert` under `-O` / `PYTHONOPTIMIZE`, so a leakage guard written as a bare assert
 silently disappears in optimized execution -- exactly the environment a scheduled job is most
-likely to run in. `PYTHONOPTIMIZE`, so a leakage guard written as a bare assert silently disappears in optimized execution -- exactly the environment a scheduled job is most likely to run in.
+likely to run in.
 """
 
 from __future__ import annotations
