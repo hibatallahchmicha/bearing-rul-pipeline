@@ -1,16 +1,19 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Register & promote — only a model that beats the clock, without crying wolf
+# MAGIC # Register & promote — the model whose alerts cost least
 # MAGIC
 # MAGIC Reads the evaluation runs from `04_train_evaluate`, retrains the best
 # MAGIC vibration model on all run-to-failure bearings, registers it in Unity
 # MAGIC Catalog with its input signature, and applies a promotion gate.
 # MAGIC
-# MAGIC **Aliases, not stages.** Unity Catalog's registry replaced the old
-# MAGIC Staging/Production stages with aliases — named pointers moved between
-# MAGIC versions. Every new version gets `challenger`; it gets `champion` only if
-# MAGIC it passes the gate. Scoring always loads `@champion`, so rollback is
-# MAGIC moving one pointer back, with no code change.
+# MAGIC **Chosen by alarm cost.** What the champion does in production is raise
+# MAGIC `maintenance_alert`. So it is picked by the cost of that decision —
+# MAGIC false alarms cost 1, missed alarms 10, the ratio in `cost_threshold`.
+# MAGIC RUL accuracy stays as a floor: it must still beat the clock.
+# MAGIC
+# MAGIC **Aliases, not stages.** Every new version gets `challenger`; it gets
+# MAGIC `champion` only if it passes the gate. Scoring loads `@champion`, so
+# MAGIC rollback is moving one pointer, with no code change.
 
 # COMMAND ----------
 
@@ -38,18 +41,14 @@ GOLD_TABLE = f"{CATALOG}.gold.features"
 MODEL_SCHEMA = f"{CATALOG}.ml"
 MODEL_NAME = f"{MODEL_SCHEMA}.rul_regressor"
 
-# Alarm budget: an operational choice, not a tuned value. A model that raises
-# more than 1 provably false alert in 20 judgeable snapshots costs more in
-# wasted inspections than its early warnings are worth.
-MAX_PROVABLE_FALSE_ALARM_RATE = 0.05
-
 LABEL_COLUMNS = [
     "bearing_id", "test_set", "channel", "snapshot_ts",
     "elapsed_hours", "rul_hours", "rul_hours_capped", "runs_to_failure",
 ]
 SCORE = "metrics.pooled_asymmetric_score_per_prediction"
-FAR_FAILING = "metrics.pooled_provable_false_alarm_rate"
-FAR_HEALTHY = "metrics.healthy_provable_false_alarm_rate"
+ALARM = "metrics.alarm_cost"
+FALSE_ALARMS = "metrics.alarm_false_alarms"
+MISSED_ALARMS = "metrics.alarm_missed_alarms"
 CLOCK_BASELINE = "baseline_linear_degradation"
 
 current_user = spark.sql("SELECT current_user()").first()[0]
@@ -66,9 +65,8 @@ client = MlflowClient()
 # MAGIC %md
 # MAGIC ## Evaluation results for the current Gold version
 # MAGIC
-# MAGIC Only runs made on the Gold version that exists now count, and only the
-# MAGIC most recent run per predictor. If Gold was rebuilt since `04` ran, the
-# MAGIC notebook stops rather than promote a model judged on other data.
+# MAGIC Only runs on the Gold version that exists now count, and only the most
+# MAGIC recent run per predictor.
 
 # COMMAND ----------
 
@@ -84,26 +82,24 @@ if "tags.mlflow.parentRunId" in runs.columns:
 
 latest = runs.drop_duplicates("params.predictor")
 assert not latest.empty, f"no evaluation runs for Gold version {gold_version} -- run 04_train_evaluate first"
-assert FAR_HEALTHY in latest.columns, "evaluation runs lack false-alarm metrics -- re-run 04_train_evaluate"
-display(latest[["params.predictor", "params.inputs", SCORE, FAR_FAILING, FAR_HEALTHY]])
+assert ALARM in latest.columns and latest[ALARM].notna().all(), (
+    "evaluation runs lack alarm cost -- re-run 04_train_evaluate"
+)
+display(latest[["params.predictor", "params.inputs", ALARM, FALSE_ALARMS, MISSED_ALARMS, SCORE]])
 
-clock_score = latest.loc[latest["params.predictor"] == CLOCK_BASELINE, SCORE].item()
-winner = latest[latest["params.inputs"] == "sensor"].sort_values(SCORE).iloc[0]
+clock = latest[latest["params.predictor"] == CLOCK_BASELINE].iloc[0]
+winner = latest[latest["params.inputs"] == "sensor"].sort_values([ALARM, SCORE]).iloc[0]
 winner_name = winner["params.predictor"]
-winner_score = float(winner[SCORE])
-winner_far_failing = float(winner[FAR_FAILING])
-winner_far_healthy = float(winner[FAR_HEALTHY])
-print(f"best vibration model: {winner_name} (score {winner_score:.1f}); clock baseline: {clock_score:.1f}")
-print(f"provable false alarms: {winner_far_failing:.3f} on failing bearings, {winner_far_healthy:.3f} on healthy bearings")
+print(f"lowest alarm cost among vibration models: {winner_name} ({winner[ALARM]:.0f})")
+print(f"clock baseline alarm cost: {clock[ALARM]:.0f}")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Retrain on all run-to-failure bearings
 # MAGIC
-# MAGIC Evaluation trained on two bearings at a time to measure generalization.
-# MAGIC The model that ships is trained on all three, with the same
-# MAGIC hyperparameters and the same `build_sensor_matrix` preparation.
+# MAGIC Same hyperparameters, same `build_sensor_matrix` preparation as
+# MAGIC evaluation. The shipped model is trained on all three failing bearings.
 
 # COMMAND ----------
 
@@ -136,10 +132,6 @@ print(f"trained {winner_name} on {len(X)} rows from {training_bearings}")
 
 # MAGIC %md
 # MAGIC ## Register with an explicit signature
-# MAGIC
-# MAGIC The signature records the 17 input columns and their types. Unity
-# MAGIC Catalog requires one, and it makes scoring with wrong-shaped data fail
-# MAGIC immediately instead of returning plausible nonsense.
 
 # COMMAND ----------
 
@@ -176,10 +168,11 @@ new_version = model_info.registered_model_version
 print(f"registered {MODEL_NAME} version {new_version}")
 
 for key, value in {
-    "eval_asym_score_per_pred": winner_score,
-    "pooled_provable_false_alarm_rate": winner_far_failing,
-    "healthy_provable_false_alarm_rate": winner_far_healthy,
-    "clock_baseline_score": clock_score,
+    "alarm_cost": float(winner[ALARM]),
+    "alarm_false_alarms": int(winner[FALSE_ALARMS]),
+    "alarm_missed_alarms": int(winner[MISSED_ALARMS]),
+    "eval_asym_score_per_pred": float(winner[SCORE]),
+    "clock_alarm_cost": float(clock[ALARM]),
     "gold_table_version": gold_version,
     "evaluation_run_id": winner["run_id"],
 }.items():
@@ -194,17 +187,17 @@ client.set_registered_model_alias(MODEL_NAME, "challenger", new_version)
 # MAGIC
 # MAGIC `champion` moves to the new version only if every check passes:
 # MAGIC
-# MAGIC 1. It beats the clock baseline — otherwise it has learned nothing the
-# MAGIC    calendar does not already know.
-# MAGIC 2. Provable false alarms on held-out failing bearings are within budget.
-# MAGIC 3. Provable false alarms on healthy bearings are within budget.
-# MAGIC 4. It beats the current champion — **if** that champion was itself
-# MAGIC    checked for false alarms. A champion promoted by the older gate, which
-# MAGIC    never measured false alarms, does not block one that passed the full
-# MAGIC    gate; otherwise the old blind spot would protect itself indefinitely.
+# MAGIC 1. It beats the clock on RUL accuracy — otherwise it has learned nothing
+# MAGIC    the calendar does not already know.
+# MAGIC 2. Its alerts cost less than the clock's.
+# MAGIC 3. Its alerts cost less than the current champion's — **if** that
+# MAGIC    champion was judged by alarm cost on the same Gold version. Costs on
+# MAGIC    different data are not comparable, and a champion promoted by an older
+# MAGIC    gate that never measured alarm cost does not block one that was.
 # MAGIC
-# MAGIC A NaN false-alarm rate (nothing judgeable) fails its check, so the gate
-# MAGIC fails safe rather than pass on no evidence.
+# MAGIC An earlier version of this gate capped the false-alarm rate at 5%. It
+# MAGIC was removed: it judged one kind of mistake in isolation, and a model
+# MAGIC that never alerts passes it perfectly.
 
 # COMMAND ----------
 
@@ -214,21 +207,23 @@ try:
 except MlflowException:
     current = None
 
+winner_cost = float(winner[ALARM])
 checks = {
-    f"beats the clock baseline ({winner_score:.1f} < {clock_score:.1f})": winner_score < clock_score,
-    f"false alarms on failing bearings <= {MAX_PROVABLE_FALSE_ALARM_RATE} ({winner_far_failing:.3f})":
-        winner_far_failing <= MAX_PROVABLE_FALSE_ALARM_RATE,
-    f"false alarms on healthy bearings <= {MAX_PROVABLE_FALSE_ALARM_RATE} ({winner_far_healthy:.3f})":
-        winner_far_healthy <= MAX_PROVABLE_FALSE_ALARM_RATE,
+    f"beats the clock on RUL accuracy ({winner[SCORE]:.1f} < {clock[SCORE]:.1f})": winner[SCORE] < clock[SCORE],
+    f"alerts cost less than the clock's ({winner_cost:.0f} < {clock[ALARM]:.0f})": winner_cost < clock[ALARM],
 }
 
-if current is not None and "healthy_provable_false_alarm_rate" in current.tags:
-    current_score = float(current.tags["eval_asym_score_per_pred"])
-    checks[f"beats champion v{current.version} ({winner_score:.1f} < {current_score:.1f})"] = (
-        winner_score < current_score
+if current is None:
+    print("note: no current champion")
+elif "alarm_cost" not in current.tags:
+    print(f"note: champion v{current.version} predates alarm-cost evaluation, so it does not block promotion")
+elif current.tags.get("gold_table_version") != str(gold_version):
+    print(f"note: champion v{current.version} was judged on different Gold data, so costs are not comparable")
+else:
+    current_cost = float(current.tags["alarm_cost"])
+    checks[f"alerts cost less than champion v{current.version}'s ({winner_cost:.0f} < {current_cost:.0f})"] = (
+        winner_cost < current_cost
     )
-elif current is not None:
-    print(f"note: champion v{current.version} predates false-alarm checks, so it does not block promotion")
 
 for description, passed in checks.items():
     print(f"{'PASS' if passed else 'FAIL'}  {description}")
@@ -244,9 +239,6 @@ else:
 
 # MAGIC %md
 # MAGIC ## Rollback, if a champion misbehaves in production
-# MAGIC
-# MAGIC Scoring loads `models:/bearing.ml.rul_regressor@champion`, never a
-# MAGIC version number. Rolling back is one call, with no redeploy:
 # MAGIC
 # MAGIC ```python
 # MAGIC client.set_registered_model_alias(MODEL_NAME, "champion", "<previous version>")
@@ -266,9 +258,10 @@ display(
             {
                 "version": int(v.version),
                 "aliases": ", ".join(v.aliases or []),
+                "alarm_cost": v.tags.get("alarm_cost"),
+                "false_alarms": v.tags.get("alarm_false_alarms"),
+                "missed_alarms": v.tags.get("alarm_missed_alarms"),
                 "eval_score": v.tags.get("eval_asym_score_per_pred"),
-                "false_alarms_failing": v.tags.get("pooled_provable_false_alarm_rate"),
-                "false_alarms_healthy": v.tags.get("healthy_provable_false_alarm_rate"),
                 "gold_version": v.tags.get("gold_table_version"),
             }
             for v in versions

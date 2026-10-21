@@ -1,21 +1,22 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Train & evaluate — does vibration beat a clock, without crying wolf?
+# MAGIC # Train & evaluate — accuracy, and the cost of the alerts it would raise
 # MAGIC
-# MAGIC Four predictors, one leave-one-bearing-out split, one metric suite, all
-# MAGIC logged to MLflow. The comparison that matters is the vibration-feature
-# MAGIC models against `baseline_linear_degradation`, which uses elapsed
-# MAGIC operating hours and nothing else.
+# MAGIC Four predictors, one leave-one-bearing-out split, all logged to MLflow.
+# MAGIC Two questions per predictor:
 # MAGIC
-# MAGIC **False alarms are measured too.** Accuracy on failing bearings says
-# MAGIC nothing about alerts on healthy ones. Two out-of-sample rates are logged:
-# MAGIC alerts on held-out failing bearings while they provably had more than the
-# MAGIC alert horizon left, and alerts on the bearings that never failed — which
-# MAGIC are never used for training, so every model sees them for the first time.
+# MAGIC 1. **Does it beat a clock?** RUL accuracy against
+# MAGIC    `baseline_linear_degradation`, which uses elapsed hours only.
+# MAGIC 2. **What do its alerts cost?** An alert fires when predicted RUL is at or
+# MAGIC    under the horizon. False alarms cost 1, missed alarms cost 10 — the
+# MAGIC    ratio from `cost_threshold`. Judged on held-out failing bearings
+# MAGIC    (both mistakes) and on healthy bearings, which never train anything
+# MAGIC    (false alarms only: they were never seen failing, so silence on them
+# MAGIC    cannot be proven wrong).
 # MAGIC
 # MAGIC **Data versioning.** Gold is read at a pinned Delta version, logged on
-# MAGIC every run. Time travel only reaches back as far as file retention (7
-# MAGIC days by default), so the MLflow run is the long-term record.
+# MAGIC every run. Time travel only reaches back as far as file retention, so
+# MAGIC the MLflow run is the long-term record.
 
 # COMMAND ----------
 
@@ -33,7 +34,12 @@ import pandas as pd
 from bearing_pdm.baselines import LinearDegradationBaseline, MeanRULBaseline
 from bearing_pdm.evaluation import split_by_unit
 from bearing_pdm.feature_matrix import build_sensor_matrix
-from bearing_pdm.metrics import DEFAULT_ALERT_HORIZON_HOURS, provable_false_alarm_rate, rul_metrics
+from bearing_pdm.metrics import (
+    DEFAULT_ALERT_HORIZON_HOURS,
+    alarm_cost,
+    provable_false_alarm_rate,
+    rul_metrics,
+)
 from bearing_pdm.normalization import DEFAULT_HEALTHY_FRACTION
 from bearing_pdm.rul_regressor import (
     DEFAULT_MAX_DEPTH,
@@ -64,10 +70,9 @@ print(f"logging to experiment: {EXPERIMENT}")
 # MAGIC %md
 # MAGIC ## Load every bearing from Gold, at a pinned version
 # MAGIC
-# MAGIC Failing bearings are used for training and evaluation; healthy ones
-# MAGIC only for measuring false alarms. `hours_to_end` is the time from each
-# MAGIC snapshot to the end of that bearing's recording: exact remaining life
-# MAGIC for a failing bearing, a lower bound for a healthy one.
+# MAGIC `hours_to_end` is the time from each snapshot to the end of that
+# MAGIC bearing's recording: exact remaining life for a failing bearing, a lower
+# MAGIC bound for a healthy one (right-censored).
 
 # COMMAND ----------
 
@@ -89,17 +94,15 @@ healthy = ~failing
 
 assert np.all(np.isfinite(X_sensor_all)), "normalized features contain NaN or inf"
 print(f"Gold version {gold_version}: {failing.sum()} failing-bearing rows, {healthy.sum()} healthy-bearing rows")
-print(ordered.groupby(["runs_to_failure", "bearing_id"]).size())
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Evaluation
 # MAGIC
-# MAGIC Per predictor: leave-one-bearing-out over the failing bearings (accuracy
-# MAGIC plus false alarms on each held-out bearing), then one model trained on all
-# MAGIC failing bearings scores the healthy ones. Every prediction is clipped to
-# MAGIC [0, cap] by the same rule, so no predictor gets an unfair advantage.
+# MAGIC Per predictor: leave-one-bearing-out over the failing bearings, then one
+# MAGIC model trained on all failing bearings scores the healthy ones. Both sets
+# MAGIC of predictions are out-of-sample, and together they give the alarm cost.
 
 # COMMAND ----------
 
@@ -139,10 +142,18 @@ for name, factory, inputs, hyperparams in PREDICTORS:
             test_unit = units_f[test_mask][0]
             model = factory().fit(X_f[train_mask], y_f[train_mask])
             pred = predict_clipped(model, X_f[test_mask], DEFAULT_RUL_CAP_HOURS)
+            fold_alarms = alarm_cost(pred, hte_f[test_mask], censored=np.zeros(len(pred), dtype=bool))
 
             with fold_run(test_unit):
                 log_rul_metrics(rul_metrics(y_f[test_mask], pred))
-                mlflow.log_metric("provable_false_alarm_rate", provable_false_alarm_rate(pred, hte_f[test_mask]))
+                mlflow.log_metrics(
+                    {
+                        "provable_false_alarm_rate": provable_false_alarm_rate(pred, hte_f[test_mask]),
+                        "alarm_cost": fold_alarms.cost,
+                        "false_alarms": fold_alarms.false_alarms,
+                        "missed_alarms": fold_alarms.missed_alarms,
+                    }
+                )
 
             fold_true.append(y_f[test_mask])
             fold_pred.append(pred)
@@ -150,16 +161,27 @@ for name, factory, inputs, hyperparams in PREDICTORS:
 
         pooled = rul_metrics(np.concatenate(fold_true), np.concatenate(fold_pred))
         log_rul_metrics(pooled, prefix="pooled_")
-        pooled_far = provable_false_alarm_rate(np.concatenate(fold_pred), np.concatenate(fold_hte))
 
         final_model = factory().fit(X_f, y_f)
         healthy_pred = predict_clipped(final_model, X_all[healthy], DEFAULT_RUL_CAP_HOURS)
-        healthy_far = provable_false_alarm_rate(healthy_pred, hours_to_end_all[healthy])
+
+        failing_pred = np.concatenate(fold_pred)
+        failing_hte = np.concatenate(fold_hte)
+        alarms = alarm_cost(
+            np.concatenate([failing_pred, healthy_pred]),
+            np.concatenate([failing_hte, hours_to_end_all[healthy]]),
+            censored=np.concatenate([np.zeros(len(failing_pred), dtype=bool), np.ones(len(healthy_pred), dtype=bool)]),
+        )
+        far_failing = provable_false_alarm_rate(failing_pred, failing_hte)
+        far_healthy = provable_false_alarm_rate(healthy_pred, hours_to_end_all[healthy])
 
         mlflow.log_metrics(
             {
-                "pooled_provable_false_alarm_rate": pooled_far,
-                "healthy_provable_false_alarm_rate": healthy_far,
+                "alarm_cost": alarms.cost,
+                "alarm_false_alarms": alarms.false_alarms,
+                "alarm_missed_alarms": alarms.missed_alarms,
+                "pooled_provable_false_alarm_rate": far_failing,
+                "healthy_provable_false_alarm_rate": far_healthy,
             }
         )
 
@@ -167,11 +189,13 @@ for name, factory, inputs, hyperparams in PREDICTORS:
         {
             "predictor": name,
             "inputs": inputs,
+            "alarm_cost": alarms.cost,
+            "false_alarms": alarms.false_alarms,
+            "missed_alarms": alarms.missed_alarms,
             "asym_score_per_pred": pooled.asymmetric_score / pooled.n,
             "mae_h": pooled.mae,
-            "late_fraction": pooled.late_fraction,
-            "false_alarms_failing": pooled_far,
-            "false_alarms_healthy": healthy_far,
+            "false_alarm_rate_failing": far_failing,
+            "false_alarm_rate_healthy": far_healthy,
         }
     )
     print(f"{name}: done")
@@ -181,11 +205,11 @@ for name, factory, inputs, hyperparams in PREDICTORS:
 # MAGIC %md
 # MAGIC ## Results
 # MAGIC
-# MAGIC Ranked by asymmetric score per prediction — lower is better. The two
-# MAGIC false-alarm columns are shares of snapshots where the model alerted
-# MAGIC while the bearing provably had more than the alert horizon left.
+# MAGIC Sorted by alarm cost — the cost of the decision the model actually makes
+# MAGIC in production. `baseline_mean` predicts one constant, so it almost never
+# MAGIC alerts: its alarm cost is the price of doing nothing.
 
 # COMMAND ----------
 
-results = pd.DataFrame(summary).sort_values("asym_score_per_pred").reset_index(drop=True)
+results = pd.DataFrame(summary).sort_values("alarm_cost").reset_index(drop=True)
 display(results.round(3))

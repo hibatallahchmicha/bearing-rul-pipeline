@@ -83,7 +83,7 @@ predicted = predict_clipped(model, pd.DataFrame(matrix, columns=feature_columns)
 scored_at = datetime.now(timezone.utc)
 predictions = ordered[["bearing_id", "test_set", "snapshot_ts", "elapsed_hours", "runs_to_failure"]].copy()
 predictions["predicted_rul_hours"] = predicted
-predictions["maintenance_alert"] = predicted <= ALERT_HORIZON_HOURS
+predictions["maintenance_alert"] = predicted <= DEFAULT_ALERT_HORIZON_HOURS
 predictions["model_name"] = MODEL_NAME
 predictions["model_version"] = int(champion.version)
 predictions["gold_table_version"] = int(gold_version)
